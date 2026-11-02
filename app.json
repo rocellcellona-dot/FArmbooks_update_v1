@@ -1,0 +1,30 @@
+{
+  "expo": {
+    "name": "FarmBooks",
+    "slug": "farmbooks-mobile-project",
+    "version": "2.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "icon": "./assets/app-icon.png",
+    "assetBundlePatterns": ["**/*"],
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/app-icon-foreground.png",
+        "backgroundColor": "#F8F5E9"
+      },
+      "softwareKeyboardLayoutMode": "resize"
+    },
+    "plugins": [
+      ["expo-splash-screen", {
+        "image": "./assets/images/splash-logo.png",
+        "imageWidth": 180,
+        "resizeMode": "contain",
+        "backgroundColor": "#F8F5E9"
+      }],
+      ["expo-image-picker", {
+        "photosPermission": "FarmBooks uses your photos to attach receipts and crop pictures to farm records.",
+        "cameraPermission": "FarmBooks uses your camera to photograph receipts and crops."
+      }]
+    ]
+  }
+}

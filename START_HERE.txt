@@ -1,0 +1,26 @@
+FARMBOOKS MOBILE — START HERE
+
+1. Extract this ZIP.
+2. Open the FarmBooks-Mobile-Project folder in VS Code (the folder containing package.json).
+3. Configure Firebase in firebase.js by replacing the YOUR_... placeholder values with your Firebase Web App configuration.
+4. Enable Firebase Authentication Email/Password.
+5. Create Firestore Database and publish the reviewed firestore.rules file.
+6. Optional: create Firebase Storage, configure storageBucket, then publish storage.rules for photo upload.
+7. In VS Code Terminal, run:
+   npm install
+   npx expo-doctor
+   npx expo start --clear
+8. Scan the terminal QR code with Expo Go.
+
+EDIT DESIGN:
+- Colors: src/theme/colors.js
+- Font/size tokens: src/theme/typography.js
+- Spacing/radii: src/theme/spacing.js
+- Intro/login/register: src/screens/auth/
+- Farmer pages: src/screens/farmer/
+- Manager pages: src/screens/manager/
+- Owner pages: src/screens/owner/
+- Shared records/reports/settings: src/screens/shared/
+- Shared visual components: src/components/
+
+Read README.md for Firebase setup, permissions, data flow, offline limits, and tests.

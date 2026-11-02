@@ -1,0 +1,1 @@
+Use the official FarmBooks artwork from `Farmbook Logo.png` across the shared `BrandLogo` component. Keep `auth-field-background.jpg` for the login and account screens. Square app-icon and splash assets are derived from the official logo; keep the original landscape logo unchanged.

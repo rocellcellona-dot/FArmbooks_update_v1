@@ -1,0 +1,38 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function userPath() { return /databases/(default)/documents/users/$(uid()); }
+    function hasProfile() { return signedIn() && firestore.exists(userPath()); }
+    function profile() { return firestore.get(userPath()).data; }
+    function farmMember(farmId) {
+      return hasProfile() && profile().farmId == farmId && profile().membershipStatus == 'active' &&
+        firestore.exists(/databases/(default)/documents/farms/$(farmId)) &&
+        (!('status' in firestore.get(/databases/(default)/documents/farms/$(farmId)).data) ||
+          firestore.get(/databases/(default)/documents/farms/$(farmId)).data.status == 'active');
+    }
+    function archivedOwner(farmId) {
+      return hasProfile() && profile().role == 'owner' && profile().farmId == farmId &&
+        profile().membershipStatus == 'archived' &&
+        firestore.get(/databases/(default)/documents/farms/$(farmId)).data.ownerId == uid() &&
+        firestore.get(/databases/(default)/documents/farms/$(farmId)).data.status == 'disbanded';
+    }
+    function ownerOfFarm(farmId) {
+      return farmMember(farmId) && profile().role == 'owner' &&
+        firestore.exists(/databases/(default)/documents/farms/$(farmId)) &&
+        firestore.get(/databases/(default)/documents/farms/$(farmId)).data.ownerId == uid();
+    }
+    function managesFarm(farmId) { return farmMember(farmId) && (profile().role == 'manager' || ownerOfFarm(farmId)); }
+    match /farms/{farmId}/transactions/{transactionId}/{fileName} {
+      // Transaction IDs are UID-prefixed, so member access can be scoped without another document lookup.
+      allow read: if signedIn() && (archivedOwner(farmId) ||
+        (farmMember(farmId) && (managesFarm(farmId) || transactionId.matches('^' + uid() + '_.*'))));
+      allow create, update: if signedIn() && farmMember(farmId) &&
+        (managesFarm(farmId) || transactionId.matches('^' + uid() + '_.*')) &&
+        request.resource.size < 8 * 1024 * 1024 && request.resource.contentType.matches('image/.*');
+      allow delete: if signedIn() && farmMember(farmId) && managesFarm(farmId);
+    }
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}

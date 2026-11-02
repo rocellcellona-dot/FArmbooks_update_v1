@@ -1,0 +1,394 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function userPath(userId) { return /databases/$(database)/documents/users/$(userId); }
+    function farmPath(farmId) { return /databases/$(database)/documents/farms/$(farmId); }
+    function hasProfile() { return signedIn() && exists(userPath(uid())); }
+    function profile() { return get(userPath(uid())).data; }
+    function activeMember(farmId) {
+      return hasProfile() && profile().farmId is string && profile().farmId == farmId &&
+        profile().membershipStatus == 'active' && exists(farmPath(farmId)) &&
+        (!('status' in get(farmPath(farmId)).data) || get(farmPath(farmId)).data.status == 'active');
+    }
+    function ownsFarm(farmId) {
+      return activeMember(farmId) && profile().role == 'owner' &&
+        exists(farmPath(farmId)) && get(farmPath(farmId)).data.ownerId == uid();
+    }
+    // During initial owner registration the new farm exists before users/{uid}.farmId is updated.
+    function isInitialOwnerOfFarm(farmId) {
+      return hasProfile() && profile().role == 'owner' && profile().farmId == null &&
+        exists(farmPath(farmId)) && get(farmPath(farmId)).data.ownerId == uid();
+    }
+    function managesFarm(farmId) {
+      return activeMember(farmId) && (profile().role == 'manager' || ownsFarm(farmId));
+    }
+    function archivedOwner(farmId) {
+      return hasProfile() && profile().role == 'owner' && profile().farmId == farmId &&
+        profile().membershipStatus == 'archived' && exists(farmPath(farmId)) &&
+        get(farmPath(farmId)).data.ownerId == uid() &&
+        get(farmPath(farmId)).data.status == 'disbanded';
+    }
+    function noActiveFarm(userData) {
+      return ((!('farmId' in userData) || userData.farmId == null || userData.farmId == '') &&
+          userData.membershipStatus != 'active') ||
+        (userData.farmId is string && exists(farmPath(userData.farmId)) &&
+          get(farmPath(userData.farmId)).data.status == 'disbanded');
+    }
+    function validRole(role) { return role in ['farmer', 'manager', 'owner']; }
+    function appPath(farmId, userId) {
+      return /databases/$(database)/documents/farmJoinApplications/$(farmId + '_' + userId);
+    }
+    function transactionPath(transactionId) {
+      return /databases/$(database)/documents/transactions/$(transactionId);
+    }
+
+    // User profiles: role is chosen at signup; members cannot elevate their own role or farm ID.
+    match /users/{userId} {
+      allow create: if signedIn() && uid() == userId &&
+        request.resource.data.uid == userId &&
+        validRole(request.resource.data.role) &&
+        request.resource.data.fullName is string && request.resource.data.fullName.size() > 0 &&
+        request.resource.data.email is string &&
+        request.resource.data.location is string &&
+        request.resource.data.farmId == null &&
+        request.resource.data.farmName is string &&
+        request.resource.data.keys().hasOnly(['uid', 'fullName', 'email', 'role', 'location', 'farmId', 'farmName', 'membershipStatus', 'createdAt']) &&
+        (request.resource.data.role == 'owner'
+          ? request.resource.data.membershipStatus == 'pending_setup'
+          : request.resource.data.membershipStatus == 'unassigned');
+
+      // Allow own-profile get even before it exists so the app can show its profile-recovery screen.
+      allow get: if signedIn() && (uid() == userId ||
+        (hasProfile() && profile().role in ['owner', 'manager'] && resource.data.farmId == profile().farmId && activeMember(profile().farmId)));
+      allow list: if signedIn() && hasProfile() && profile().role in ['owner', 'manager'] &&
+        activeMember(profile().farmId) && resource.data.farmId == profile().farmId;
+
+      allow update: if signedIn() && (
+        // Basic self-profile edits only. No self-assigned role, farm, or membership status.
+        (uid() == userId && request.resource.data.role == resource.data.role &&
+          request.resource.data.farmId == resource.data.farmId &&
+          request.resource.data.membershipStatus == resource.data.membershipStatus &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['fullName', 'location', 'updatedAt']))
+        ||
+        // Owner completes initial farm setup after the farm document has been created.
+        (uid() == userId && resource.data.role == 'owner' && resource.data.farmId == null &&
+          request.resource.data.role == 'owner' && request.resource.data.farmId is string &&
+          isInitialOwnerOfFarm(request.resource.data.farmId) && request.resource.data.membershipStatus == 'active' &&
+          request.resource.data.farmName == get(farmPath(request.resource.data.farmId)).data.name &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['farmId', 'farmName', 'membershipStatus', 'updatedAt']))
+        ||
+        // Owner approval and profile membership are committed together in one batch.
+        (noActiveFarm(resource.data) && request.resource.data.farmId is string &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.membershipStatus == 'active' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['farmId', 'farmName', 'membershipStatus', 'joinedAt', 'updatedAt']) &&
+          ownsFarm(request.resource.data.farmId) &&
+          request.resource.data.farmName == get(farmPath(request.resource.data.farmId)).data.name &&
+          getAfter(appPath(request.resource.data.farmId, userId)).data.status == 'approved' &&
+          getAfter(appPath(request.resource.data.farmId, userId)).data.userId == userId &&
+          getAfter(appPath(request.resource.data.farmId, userId)).data.requestedRole == resource.data.role)
+        ||
+        // Members can leave only their current farm; the profile remains the authority for access.
+        (uid() == userId && activeMember(resource.data.farmId) &&
+          resource.data.role in ['farmer', 'manager'] &&
+          request.resource.data.farmId == null && request.resource.data.farmName == '' &&
+          request.resource.data.membershipStatus == 'left' &&
+          request.resource.data.formerFarmId == resource.data.farmId &&
+          request.resource.data.formerFarmName == resource.data.farmName &&
+          request.resource.data.membershipChangedBy == uid() &&
+          request.resource.data.membershipChangeReason == 'Left voluntarily' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['farmId', 'farmName', 'membershipStatus', 'formerFarmId', 'formerFarmName', 'membershipChangedBy', 'membershipChangeReason', 'membershipChangedAt', 'updatedAt']) &&
+          request.resource.data.membershipChangedAt == request.time &&
+          request.resource.data.updatedAt == request.time)
+        ||
+        // A farm's actual Owner can remove active non-owner members, but cannot change their role.
+        (uid() != userId && ownsFarm(resource.data.farmId) &&
+          resource.data.role in ['farmer', 'manager'] && resource.data.membershipStatus == 'active' &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.farmId == null && request.resource.data.farmName == '' &&
+          request.resource.data.membershipStatus in ['removed', 'kicked'] &&
+          request.resource.data.formerFarmId == resource.data.farmId &&
+          request.resource.data.formerFarmName == resource.data.farmName &&
+          request.resource.data.membershipChangedBy == uid() &&
+          request.resource.data.membershipChangedAt == request.time &&
+          request.resource.data.updatedAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['farmId', 'farmName', 'membershipStatus', 'formerFarmId', 'formerFarmName', 'membershipChangedBy', 'membershipChangedAt', 'membershipChangeReason', 'updatedAt']) &&
+          request.resource.data.membershipChangeReason is string &&
+          request.resource.data.membershipChangeReason.size() <= 500)
+        ||
+        // The Owner keeps only archived-record access after the farm is disbanded.
+        (uid() == userId && resource.data.role == 'owner' && resource.data.membershipStatus == 'active' &&
+          request.resource.data.role == 'owner' && request.resource.data.farmId == resource.data.farmId &&
+          request.resource.data.membershipStatus == 'archived' &&
+          request.resource.data.membershipChangedAt == request.time &&
+          request.resource.data.updatedAt == request.time &&
+          getAfter(farmPath(resource.data.farmId)).data.status == 'disbanded' &&
+          getAfter(farmPath(resource.data.farmId)).data.disbandedBy == uid() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['membershipStatus', 'membershipChangedAt', 'updatedAt']))
+      );
+      allow delete: if false;
+    }
+
+    // Only minimal directory fields should be stored in farm documents.
+    match /farms/{farmId} {
+      allow get, list: if signedIn();
+      allow create: if signedIn() && hasProfile() && profile().role == 'owner' && profile().farmId == null &&
+        request.resource.data.ownerId == uid() &&
+        request.resource.data.name is string && request.resource.data.name.size() > 0 &&
+        request.resource.data.location is string &&
+        (!('status' in request.resource.data) || request.resource.data.status == 'active') &&
+        request.resource.data.keys().hasOnly(['name', 'location', 'ownerId', 'ownerName', 'status', 'createdAt', 'updatedAt']);
+      allow update: if ownsFarm(farmId) && request.resource.data.ownerId == resource.data.ownerId &&
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'location', 'updatedAt'])
+          ||
+          (resource.data.ownerId == uid() && (!('status' in resource.data) || resource.data.status == 'active') &&
+            request.resource.data.status == 'disbanded' && request.resource.data.disbandedBy == uid() &&
+            request.resource.data.disbandedAt == request.time && request.resource.data.updatedAt == request.time &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'disbandedBy', 'disbandedAt', 'updatedAt']) &&
+            getAfter(userPath(uid())).data.membershipStatus == 'archived')
+        );
+      allow delete: if false;
+    }
+
+    match /farmJoinApplications/{applicationId} {
+      // Applicant can safely get their own deterministic path even when no document exists yet.
+      // This avoids the missing-document get being denied before the duplicate check.
+      allow get: if signedIn() && hasProfile() && (
+        (noActiveFarm(profile()) &&
+  profile().role in ['farmer', 'manager'] && applicationId.matches('.*_' + uid() + '$')) ||
+        (exists(/databases/$(database)/documents/farmJoinApplications/$(applicationId)) &&
+          (ownsFarm(resource.data.farmId) || resource.data.userId == uid()))
+      );
+      allow list: if signedIn() && hasProfile() && (
+        (profile().role == 'owner' && ownsFarm(profile().farmId) && resource.data.farmId == profile().farmId) ||
+        resource.data.userId == uid()
+      );
+      allow create: if signedIn() && hasProfile() && noActiveFarm(profile()) &&
+        profile().role in ['farmer', 'manager'] &&
+        applicationId == request.resource.data.farmId + '_' + uid() &&
+        request.resource.data.userId == uid() &&
+        request.resource.data.userName == profile().fullName &&
+        request.resource.data.userEmail == profile().email &&
+        request.resource.data.requestedRole == profile().role &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.farmId is string &&
+        exists(farmPath(request.resource.data.farmId)) &&
+        (!('status' in get(farmPath(request.resource.data.farmId)).data) ||
+          get(farmPath(request.resource.data.farmId)).data.status == 'active') &&
+        request.resource.data.farmName == get(farmPath(request.resource.data.farmId)).data.name &&
+        request.resource.data.keys().hasOnly(['farmId', 'farmName', 'userId', 'userName', 'userEmail', 'requestedRole', 'status', 'createdAt']) &&
+        request.resource.data.createdAt == request.time;
+      allow update: if signedIn() && hasProfile() && (
+        // Only the farm owner may approve or reject a pending application for their farm.
+        (ownsFarm(resource.data.farmId) && resource.data.status == 'pending' &&
+          applicationId == resource.data.farmId + '_' + resource.data.userId &&
+          request.resource.data.userId == resource.data.userId &&
+          request.resource.data.farmId == resource.data.farmId &&
+          request.resource.data.status in ['approved', 'rejected'] &&
+          request.resource.data.reviewedBy == uid() && request.resource.data.reviewedAt == request.time &&
+          (request.resource.data.status != 'approved' ||
+            (exists(userPath(resource.data.userId)) &&
+              get(userPath(resource.data.userId)).data.role == resource.data.requestedRole &&
+              noActiveFarm(get(userPath(resource.data.userId)).data))) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'reviewedBy', 'reviewedAt']))
+        ||
+        // Applicants may resubmit a rejected request or reapply after leaving an approved membership.
+        (resource.data.userId == uid() && resource.data.status in ['rejected', 'approved'] && hasProfile() &&
+          applicationId == resource.data.farmId + '_' + uid() &&
+          noActiveFarm(profile()) &&
+          request.resource.data.userId == resource.data.userId &&
+          request.resource.data.farmId == resource.data.farmId &&
+          request.resource.data.requestedRole == resource.data.requestedRole &&
+          exists(farmPath(resource.data.farmId)) &&
+          (!('status' in get(farmPath(resource.data.farmId)).data) ||
+            get(farmPath(resource.data.farmId)).data.status == 'active') &&
+          request.resource.data.status == 'pending' &&
+          request.resource.data.createdAt == request.time && request.resource.data.reappliedAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'createdAt', 'reappliedAt']))
+        ||
+        // An applicant can withdraw pending requests without changing their identity or requested role.
+        (resource.data.userId == uid() && resource.data.status == 'pending' &&
+          request.resource.data.userId == resource.data.userId &&
+          request.resource.data.farmId == resource.data.farmId &&
+          request.resource.data.requestedRole == resource.data.requestedRole &&
+          request.resource.data.status == 'withdrawn' && request.resource.data.withdrawnAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'withdrawnAt']))
+      );
+      allow delete: if false;
+    }
+
+    match /transactions/{transactionId} {
+      // IDs begin with the creator UID. The prefix branch permits a safe get of a missing queued
+      // transaction during offline-sync duplicate detection without granting access to other IDs.
+      allow get: if signedIn() && hasProfile() && (
+        (transactionId.matches('^' + uid() + '_.*') &&
+          (!exists(transactionPath(transactionId)) ||
+            (activeMember(resource.data.farmId) && resource.data.createdBy == uid()))) ||
+        archivedOwner(resource.data.farmId) ||
+        managesFarm(resource.data.farmId) ||
+        (activeMember(resource.data.farmId) && resource.data.createdBy == uid())
+      );
+      allow list: if signedIn() && hasProfile() && (
+        archivedOwner(resource.data.farmId) ||
+        (profile().role in ['owner', 'manager'] && managesFarm(resource.data.farmId) && resource.data.farmId == profile().farmId) ||
+        (activeMember(resource.data.farmId) && resource.data.farmId == profile().farmId && resource.data.createdBy == uid())
+      );
+      allow create: if signedIn() && hasProfile() && activeMember(request.resource.data.farmId) &&
+        request.resource.data.createdBy == uid() &&
+        request.resource.data.status == 'active' &&
+        request.resource.data.type in ['income', 'expense'] &&
+        request.resource.data.category is string && request.resource.data.category.size() > 0 &&
+        request.resource.data.amount is number && request.resource.data.amount > 0 &&
+        request.resource.data.quantity is number && request.resource.data.quantity > 0 &&
+        request.resource.data.unitPrice is number && request.resource.data.unitPrice >= 0 &&
+        request.resource.data.keys().hasOnly(['farmId', 'farmName', 'createdBy', 'createdByName', 'type', 'category', 'quantity', 'unitPrice', 'amount', 'dateISO', 'cropName', 'description', 'status', 'createdAt']);
+      allow update: if signedIn() && hasProfile() && (
+        // Farmer cancels their own active transaction with a required reason.
+        (activeMember(resource.data.farmId) && profile().role == 'farmer' &&
+          resource.data.createdBy == uid() && resource.data.status == 'active' &&
+          request.resource.data.status == 'cancelled' && request.resource.data.cancelledBy == uid() &&
+          request.resource.data.cancellationReason is string && request.resource.data.cancellationReason.size() > 0 && request.resource.data.cancellationReason.size() <= 500 &&
+          request.resource.data.cancelledAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancellationReason', 'cancelledBy', 'cancelledAt']))
+        ||
+        // Manager or owner soft-deletes an authorized farm record; no physical deletion.
+        (managesFarm(resource.data.farmId) && resource.data.status in ['active', 'cancelled'] &&
+          request.resource.data.status == 'deleted' && request.resource.data.deletedBy == uid() &&
+          request.resource.data.deletedAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'deletedBy', 'deletedAt']))
+        ||
+        // Creator can attach/update a photo only on their own active transaction.
+        (activeMember(resource.data.farmId) && resource.data.createdBy == uid() && resource.data.status == 'active' &&
+          request.resource.data.status == resource.data.status &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['photoUrl', 'photoPath', 'updatedAt']) &&
+          request.resource.data.photoUrl is string && request.resource.data.photoPath is string)
+      );
+      allow delete: if false;
+    }
+
+    match /assignments/{assignmentId} {
+      allow create: if signedIn() && hasProfile() && managesFarm(request.resource.data.farmId) &&
+        request.resource.data.createdBy == uid() &&
+        request.resource.data.assignedTo is string &&
+        exists(userPath(request.resource.data.assignedTo)) &&
+        get(userPath(request.resource.data.assignedTo)).data.farmId == request.resource.data.farmId &&
+        get(userPath(request.resource.data.assignedTo)).data.role == 'farmer' &&
+        get(userPath(request.resource.data.assignedTo)).data.membershipStatus == 'active' &&
+        request.resource.data.cropName is string && request.resource.data.cropName.size() > 0 &&
+        request.resource.data.task is string && request.resource.data.task.size() > 0 &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.keys().hasOnly(['farmId', 'createdBy', 'createdByName', 'assignedTo', 'assignedToName', 'cropName', 'task', 'dueDate', 'status', 'createdAt', 'updatedAt']);
+      allow get: if signedIn() && hasProfile() && activeMember(resource.data.farmId) &&
+        (profile().role in ['owner', 'manager'] || resource.data.assignedTo == uid());
+      allow list: if signedIn() && hasProfile() && (
+        (profile().role in ['owner', 'manager'] && managesFarm(resource.data.farmId) && resource.data.farmId == profile().farmId) ||
+        (activeMember(resource.data.farmId) && resource.data.assignedTo == uid() && resource.data.farmId == profile().farmId)
+      );
+      allow update: if signedIn() && hasProfile() && activeMember(resource.data.farmId) && (
+        (profile().role in ['owner', 'manager'] && managesFarm(resource.data.farmId) &&
+          resource.data.status in ['pending', 'in_progress', 'completed'] &&
+          request.resource.data.farmId == resource.data.farmId && request.resource.data.createdBy == resource.data.createdBy &&
+          exists(userPath(request.resource.data.assignedTo)) &&
+          get(userPath(request.resource.data.assignedTo)).data.farmId == resource.data.farmId &&
+          get(userPath(request.resource.data.assignedTo)).data.role == 'farmer' &&
+          get(userPath(request.resource.data.assignedTo)).data.membershipStatus == 'active' &&
+          request.resource.data.status in ['pending', 'in_progress', 'completed'] &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['task', 'cropName', 'assignedTo', 'assignedToName', 'dueDate', 'status', 'updatedAt']))
+        ||
+        (resource.data.assignedTo == uid() && resource.data.status in ['pending', 'in_progress'] &&
+          request.resource.data.assignedTo == resource.data.assignedTo &&
+          request.resource.data.farmId == resource.data.farmId &&
+          request.resource.data.status in ['in_progress', 'completed'] &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'completionNote', 'updatedAt']))
+        ||
+        // Membership-ending batches may close pending work while revoking the assignee atomically.
+        (ownsFarm(resource.data.farmId) && resource.data.assignedTo != uid() &&
+          resource.data.status in ['pending', 'in_progress'] &&
+          request.resource.data.farmId == resource.data.farmId &&
+          request.resource.data.assignedTo == resource.data.assignedTo &&
+          request.resource.data.status == 'cancelled' && request.resource.data.cancelledBy == uid() &&
+          request.resource.data.cancelledAt == request.time &&
+          request.resource.data.cancellationReason is string &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledBy', 'cancelledAt', 'cancellationReason', 'updatedAt']) &&
+          request.resource.data.updatedAt == request.time &&
+          getAfter(userPath(resource.data.assignedTo)).data.membershipStatus in ['removed', 'kicked'] &&
+          getAfter(userPath(resource.data.assignedTo)).data.farmId == null)
+        ||
+        (resource.data.assignedTo == uid() && resource.data.status in ['pending', 'in_progress'] &&
+          request.resource.data.farmId == resource.data.farmId &&
+          request.resource.data.assignedTo == resource.data.assignedTo &&
+          request.resource.data.status == 'cancelled' && request.resource.data.cancelledBy == uid() &&
+          request.resource.data.cancelledAt == request.time &&
+          request.resource.data.cancellationReason is string &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledBy', 'cancelledAt', 'cancellationReason', 'updatedAt']) &&
+          request.resource.data.updatedAt == request.time &&
+          getAfter(userPath(uid())).data.membershipStatus == 'left' &&
+          getAfter(userPath(uid())).data.farmId == null)
+      );
+      allow delete: if false;
+    }
+
+    match /farmMembershipEvents/{eventId} {
+      allow get, list: if signedIn() && hasProfile() && (
+        resource.data.userId == uid() ||
+        ownsFarm(resource.data.farmId) ||
+        archivedOwner(resource.data.farmId)
+      );
+      allow create: if signedIn() && hasProfile() &&
+        request.resource.data.keys().hasOnly(['farmId', 'farmName', 'userId', 'userName', 'userRole', 'action', 'changedBy', 'changedByName', 'reason', 'changedAt']) &&
+        request.resource.data.farmId is string &&
+        request.resource.data.farmName is string &&
+        request.resource.data.userId is string &&
+        request.resource.data.userName is string &&
+        request.resource.data.userRole in ['farmer', 'manager', 'owner'] &&
+        request.resource.data.changedBy == uid() &&
+        request.resource.data.changedAt == request.time &&
+        request.resource.data.reason is string &&
+        request.resource.data.reason.size() <= 500 &&
+        (
+          (request.resource.data.action == 'left' &&
+            request.resource.data.userId == uid() &&
+            request.resource.data.userRole in ['farmer', 'manager'] &&
+            activeMember(request.resource.data.farmId) &&
+            request.resource.data.farmName == get(farmPath(request.resource.data.farmId)).data.name &&
+            request.resource.data.userName == profile().fullName &&
+            request.resource.data.changedByName == profile().fullName &&
+            request.resource.data.reason == 'Left voluntarily' &&
+            getAfter(userPath(uid())).data.farmId == null &&
+            getAfter(userPath(uid())).data.membershipStatus == 'left')
+          ||
+          (request.resource.data.action in ['removed', 'kicked'] &&
+            ownsFarm(request.resource.data.farmId) &&
+            request.resource.data.userId != uid() &&
+            request.resource.data.userRole in ['farmer', 'manager'] &&
+            request.resource.data.farmName == get(farmPath(request.resource.data.farmId)).data.name &&
+            request.resource.data.changedByName == profile().fullName &&
+            exists(userPath(request.resource.data.userId)) &&
+            get(userPath(request.resource.data.userId)).data.farmId == request.resource.data.farmId &&
+            get(userPath(request.resource.data.userId)).data.role == request.resource.data.userRole &&
+            request.resource.data.userName == get(userPath(request.resource.data.userId)).data.fullName &&
+            getAfter(userPath(request.resource.data.userId)).data.farmId == null &&
+            getAfter(userPath(request.resource.data.userId)).data.membershipStatus == request.resource.data.action &&
+            getAfter(userPath(request.resource.data.userId)).data.membershipChangedBy == uid() &&
+            getAfter(userPath(request.resource.data.userId)).data.membershipChangeReason == request.resource.data.reason)
+          ||
+          (request.resource.data.action == 'disbanded' &&
+            ownsFarm(request.resource.data.farmId) &&
+            request.resource.data.userId == uid() &&
+            request.resource.data.userRole == 'owner' &&
+            request.resource.data.userName == profile().fullName &&
+            request.resource.data.changedByName == profile().fullName &&
+            request.resource.data.farmName == get(farmPath(request.resource.data.farmId)).data.name &&
+            request.resource.data.reason == 'Farm disbanded' &&
+            getAfter(farmPath(request.resource.data.farmId)).data.status == 'disbanded' &&
+            getAfter(userPath(uid())).data.membershipStatus == 'archived')
+        );
+      allow update, delete: if false;
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}
